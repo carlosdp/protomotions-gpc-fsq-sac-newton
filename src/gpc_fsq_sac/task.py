@@ -223,6 +223,7 @@ def build_ppo_agent_config(
         layers=[MLPLayerConfig(units=1024, activation="relu") for _ in range(4)],
     )
     return PPOAgentConfig(
+        num_steps=24,
         model=PPOModelConfig(
             in_keys=["max_coords_obs", "mimic_target_poses"],
             out_keys=["action", "mean_action", "neglogp", "value"],
