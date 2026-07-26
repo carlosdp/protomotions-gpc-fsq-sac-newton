@@ -80,6 +80,7 @@ class FSQSACAgent(BaseAgent):
             self._setup_obs_td,
             self.config.replay_buffer_size,
         )
+        self.root_dir.mkdir(parents=True, exist_ok=True)
         profile_path = self.root_dir / "replay_profile.json"
         profile_path.write_text(json.dumps(self.replay_profile, indent=2) + "\n")
         log.info("Replay profile: %s", json.dumps(self.replay_profile, sort_keys=True))
