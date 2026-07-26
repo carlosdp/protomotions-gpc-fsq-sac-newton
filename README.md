@@ -31,6 +31,12 @@ single action `tanh`; the SAC task disables ProtoMotions' action transform so ac
 are not squashed twice. The PPO baseline emits its Gaussian action before the task's
 single standard ProtoMotions `tanh`.
 
+The downstream experiment raises Newton's constraint-row capacity from the generic
+450 default to 1,024. SOMA23 evaluation can require 456 rows in broad contact, so this
+provides more than 2x measured headroom. Its evaluator also leaves unused vectorized
+Newton worlds in valid states instead of applying the generic PhysX-oriented parking
+strategy; metrics still include each of the 61 motion IDs exactly once.
+
 ## Requirements
 
 - Linux x86_64
@@ -163,4 +169,3 @@ Newton transitions, populate the released replay buffer, execute finite twin-Q, 
 and temperature updates, save a reloadable checkpoint, and complete a fixed-order
 61-motion evaluation. The PPO comparison must begin from a fresh run and finish with the
 same environment-interaction count.
-

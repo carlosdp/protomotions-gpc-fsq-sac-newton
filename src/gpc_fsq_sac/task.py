@@ -100,10 +100,14 @@ def configure_robot_and_simulator(
     simulator_cfg: SimulatorConfig,
     args: argparse.Namespace,
 ):
-    del simulator_cfg, args
+    del args
     robot_cfg.update_fields(
         contact_bodies=["all_left_foot_bodies", "all_right_foot_bodies"]
     )
+    # SOMA23 can exceed Newton's generic 450-row default during broad contact.
+    # 1024 gives >2x headroom over the observed 456-row requirement.
+    simulator_cfg.sim.njmax = 1024
+    robot_cfg.simulation_params.newton.njmax = 1024
 
 
 def evaluator_config(eval_metrics_every: int):
@@ -118,7 +122,9 @@ def evaluator_config(eval_metrics_every: int):
     )
 
     return MimicEvaluatorConfig(
+        _target_="gpc_fsq_sac.evaluator.NewtonMimicEvaluator",
         eval_metrics_every=eval_metrics_every,
+        save_predicted_motion_lib_every=None,
         evaluation_components={
             "gt_error": gt_error_factory(threshold=0.5),
             "gr_error": gr_error_factory(),
@@ -262,4 +268,3 @@ def apply_inference_overrides(
     env_cfg.max_episode_length = 1_000_000
     env_cfg.motion_manager.resample_on_reset = True
     env_cfg.motion_manager.init_start_prob = 1.0
-
