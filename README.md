@@ -135,8 +135,9 @@ counts are not equivalent.
 
 ## Evaluate and compare
 
-Training performs a deterministic full evaluation in fixed motion-ID order and writes
-`evaluation_final.json`. To re-run a checkpoint evaluation:
+SAC training performs a deterministic full evaluation in fixed motion-ID order and
+writes `evaluation_final.json`. Run the same packaged evaluator after PPO training, or
+to re-evaluate any checkpoint:
 
 ```bash
 uv run gpc-fsq evaluate \

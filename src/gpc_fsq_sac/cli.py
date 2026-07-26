@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import shlex
+import subprocess
 import sys
 from importlib import resources
 from pathlib import Path
@@ -104,6 +105,56 @@ def build_eval_command(args: argparse.Namespace) -> list[str]:
     ]
 
 
+def parse_evaluation_output(output: str, checkpoint: Path) -> dict:
+    metrics: dict[str, float] = {}
+    score = None
+    num_evaluated = None
+    for line in output.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("eval/") and ":" in stripped:
+            key, value = stripped.split(":", 1)
+            metrics[key] = float(value.strip())
+        elif stripped.startswith("Items Evaluated:"):
+            num_evaluated = int(stripped.split(":", 1)[1])
+        elif stripped.startswith("Overall Score:"):
+            score = float(stripped.split(":", 1)[1])
+
+    if num_evaluated is None:
+        num_evaluated = int(metrics.get("eval/num_evaluated", 0))
+    if num_evaluated != 61:
+        raise ValueError(f"expected all 61 fixed-order motions, evaluated {num_evaluated}")
+
+    import torch
+
+    checkpoint_state = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    metrics.update(
+        {
+            "score": score,
+            "num_evaluated": num_evaluated,
+            "fixed_order_motion_ids": list(range(num_evaluated)),
+            "epoch": int(checkpoint_state["epoch"]),
+            "step_count": int(checkpoint_state["step_count"]),
+        }
+    )
+    return metrics
+
+
+def run_evaluation(args: argparse.Namespace) -> int:
+    command = build_eval_command(args)
+    completed = subprocess.run(command, text=True, capture_output=True, check=False)
+    print(completed.stdout, end="")
+    print(completed.stderr, end="", file=sys.stderr)
+    completed.check_returncode()
+
+    checkpoint = args.checkpoint.expanduser().resolve()
+    output_path = args.output or checkpoint.parent / "evaluation_final.json"
+    result = parse_evaluation_output(completed.stdout, checkpoint)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(result, indent=2) + "\n")
+    print(f"Wrote {output_path}")
+    return 0
+
+
 def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="gpc-fsq")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -134,6 +185,7 @@ def create_parser() -> argparse.ArgumentParser:
     evaluate = subparsers.add_parser("evaluate")
     evaluate.add_argument("--checkpoint", type=Path, required=True)
     evaluate.add_argument("--motion-file", type=Path, default=default_motion_path())
+    evaluate.add_argument("--output", type=Path)
     evaluate.add_argument("--print-command", action="store_true")
 
     compare = subparsers.add_parser("compare")
@@ -204,7 +256,10 @@ def main() -> int:
         os.environ.setdefault("WANDB_TAGS", "soma23-mini,fsq,newton,controlled-comparison")
     else:
         verify_motion_manifest(args.motion_file)
-        command = build_eval_command(args)
+        if args.print_command:
+            print(shlex.join(build_eval_command(args)))
+            return 0
+        return run_evaluation(args)
 
     if args.print_command:
         print(shlex.join(command))

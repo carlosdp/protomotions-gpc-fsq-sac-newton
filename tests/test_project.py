@@ -6,7 +6,12 @@ from pathlib import Path
 
 import pytest
 
-from gpc_fsq_sac.cli import build_train_command, compare_results, create_parser
+from gpc_fsq_sac.cli import (
+    build_train_command,
+    compare_results,
+    create_parser,
+    parse_evaluation_output,
+)
 from gpc_fsq_sac.constants import MOTION_COUNT, MOTION_MANIFEST_SHA256
 from gpc_fsq_sac.fixture import manifest_from_payload
 
@@ -83,3 +88,28 @@ def test_compare_requires_all_motions(tmp_path):
     ppo.write_text(json.dumps({"step_count": 10, "num_evaluated": 60}))
     with pytest.raises(ValueError, match="61"):
         compare_results(sac, ppo)
+
+
+def test_evaluation_parser_requires_all_fixed_order_motions(tmp_path, monkeypatch):
+    checkpoint = tmp_path / "last.ckpt"
+    checkpoint.write_bytes(b"checkpoint")
+
+    class TorchStub:
+        @staticmethod
+        def load(*_args, **_kwargs):
+            return {"epoch": 100, "step_count": 1_228_800}
+
+    monkeypatch.setitem(__import__("sys").modules, "torch", TorchStub)
+    output = "\n".join(
+        [
+            "  eval/success_rate: 0.250000",
+            "  eval/num_evaluated: 61.000000",
+            "  Items Evaluated: 61",
+            "  Overall Score: 0.250000",
+        ]
+    )
+    parsed = parse_evaluation_output(output, checkpoint)
+    assert parsed["num_evaluated"] == 61
+    assert parsed["fixed_order_motion_ids"] == list(range(61))
+    assert parsed["epoch"] == 100
+    assert parsed["step_count"] == 1_228_800
