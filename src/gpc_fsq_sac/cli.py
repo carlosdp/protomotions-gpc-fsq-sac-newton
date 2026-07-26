@@ -24,10 +24,25 @@ def experiment_path(algorithm: str) -> Path:
     return Path(str(resources.files("gpc_fsq_sac.experiments").joinpath(name)))
 
 
+def resolved_batch_size(args: argparse.Namespace) -> int:
+    batch_size = args.batch_size
+    if batch_size is None:
+        batch_size = 8_192 if args.algorithm == "sac" else 6_144
+    rollout_size = args.num_envs * getattr(args, "rollout_steps", DEFAULT_ROLLOUT_STEPS)
+    if args.algorithm == "ppo" and rollout_size % batch_size:
+        raise ValueError(
+            "PPO requires num_envs * rollout_steps to be divisible by batch_size: "
+            f"{args.num_envs} * {getattr(args, 'rollout_steps', DEFAULT_ROLLOUT_STEPS)} "
+            f"= {rollout_size}, which is not divisible by {batch_size}"
+        )
+    return batch_size
+
+
 def build_train_command(args: argparse.Namespace) -> list[str]:
     experiment_name = args.experiment_name or (
         f"soma23_bones_seed_mini_fsq_{args.algorithm}_seed{args.seed}"
     )
+    batch_size = resolved_batch_size(args)
     command = [
         sys.executable,
         "-m",
@@ -45,7 +60,7 @@ def build_train_command(args: argparse.Namespace) -> list[str]:
         "--num-envs",
         str(args.num_envs),
         "--batch-size",
-        str(args.batch_size),
+        str(batch_size),
         "--training-max-steps",
         str(args.training_steps),
         "--seed",
@@ -105,7 +120,7 @@ def create_parser() -> argparse.ArgumentParser:
     train.add_argument("--motion-file", type=Path, default=default_motion_path())
     train.add_argument("--num-envs", type=int, default=DEFAULT_NUM_ENVS)
     train.add_argument("--rollout-steps", type=int, default=DEFAULT_ROLLOUT_STEPS)
-    train.add_argument("--batch-size", type=int, default=8192)
+    train.add_argument("--batch-size", type=int)
     train.add_argument("--training-steps", type=int, default=DEFAULT_TRAINING_STEPS)
     train.add_argument("--seed", type=int, default=0)
     train.add_argument("--experiment-name")

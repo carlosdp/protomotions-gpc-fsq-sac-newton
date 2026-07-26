@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from gpc_fsq_sac.cli import build_train_command, compare_results
+from gpc_fsq_sac.cli import build_train_command, compare_results, create_parser
 from gpc_fsq_sac.constants import MOTION_COUNT, MOTION_MANIFEST_SHA256
 from gpc_fsq_sac.fixture import manifest_from_payload
 
@@ -18,7 +18,8 @@ def train_args(tmp_path: Path, algorithm: str) -> argparse.Namespace:
         seed=3,
         motion_file=tmp_path / "fixture.pt",
         num_envs=64,
-        batch_size=8192,
+        rollout_steps=24,
+        batch_size=768,
         training_steps=98_304,
         use_wandb=True,
         target_entropy_scale=0.167,
@@ -47,6 +48,19 @@ def test_ppo_command_uses_same_requested_interaction_budget(tmp_path):
     assert sac_steps == ppo_steps == "98304"
 
 
+def test_default_ppo_batch_divides_default_rollout():
+    args = create_parser().parse_args(["train", "ppo"])
+    command = build_train_command(args)
+    assert command[command.index("--batch-size") + 1] == "6144"
+
+
+def test_ppo_rejects_non_divisible_batch(tmp_path):
+    args = train_args(tmp_path, "ppo")
+    args.batch_size = 8192
+    with pytest.raises(ValueError, match="not divisible"):
+        build_train_command(args)
+
+
 def test_manifest_payload_contract():
     names = [f"motion_{index:02d}" for index in range(MOTION_COUNT)]
     assert manifest_from_payload({"motion_files": tuple(names)}) == names
@@ -69,4 +83,3 @@ def test_compare_requires_all_motions(tmp_path):
     ppo.write_text(json.dumps({"step_count": 10, "num_evaluated": 60}))
     with pytest.raises(ValueError, match="61"):
         compare_results(sac, ppo)
-

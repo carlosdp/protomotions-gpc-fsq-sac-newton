@@ -126,10 +126,12 @@ uv run gpc-fsq train ppo \
   --use-wandb
 ```
 
-PPO retains the public ProtoMotions FSQ architecture and optimizer configuration. Equal
-environment interactions are the comparison invariant; SAC optimizer updates and wall
-clock are logged separately because off-policy and on-policy update counts are not
-equivalent.
+PPO retains the public ProtoMotions FSQ architecture and optimizer configuration. With
+the default 512 environments and 24-step rollout, its default batch size is 6,144 (two
+minibatches per rollout); the CLI rejects batch sizes that do not divide the collected
+rollout. Equal environment interactions are the comparison invariant; SAC optimizer
+updates and wall clock are logged separately because off-policy and on-policy update
+counts are not equivalent.
 
 ## Evaluate and compare
 
