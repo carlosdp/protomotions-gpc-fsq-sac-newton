@@ -1,0 +1,25 @@
+"""Pinned sources and controlled-comparison defaults."""
+
+from __future__ import annotations
+
+PROTO_MOTIONS_REV = "7fd6d2a82d2cf6953307acc92f021d68231ea89d"
+RSL_RL_SAC_REV = "e0d243aa6d3f8a7231783b7f3cefeaec1b4a5521"
+
+MOTION_FILENAME = "soma23_bones_seed_mini.pt"
+MOTION_URL = (
+    "https://media.githubusercontent.com/media/carlosdp/ProtoMotions/"
+    f"{PROTO_MOTIONS_REV}/data/motion_for_trackers/{MOTION_FILENAME}"
+)
+MOTION_SHA256 = "4189b48d5343e753c79081d27274186e091be4b451b1b7e326296806b6865502"
+MOTION_BYTES = 26_719_897
+MOTION_COUNT = 61
+MOTION_MANIFEST_SHA256 = "0ed4c8f78a061154467cf583c6bb677a63c80b4a78f7f3b1c6b365a5606d18ec"
+
+DEFAULT_NUM_ENVS = 512
+DEFAULT_ROLLOUT_STEPS = 24
+DEFAULT_TARGET_ENTROPY_SCALE = 0.167
+DEFAULT_REPLAY_TRANSITIONS = 262_144
+DEFAULT_TRAINING_STEPS = 25_165_824
+DEFAULT_EVAL_EVERY = 200
+WANDB_PROJECT = "physical_animation"
+

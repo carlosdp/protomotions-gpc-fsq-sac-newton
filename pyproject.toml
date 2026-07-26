@@ -1,0 +1,57 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "protomotions-gpc-fsq-sac-newton"
+version = "0.1.0"
+description = "Downstream ProtoMotions FSQ motion tracker trained with the released rsl_rl SAC learner"
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Carlos Diaz-Padron" }]
+dependencies = [
+  "protomotions[newton]",
+  "rsl-rl-lib",
+  "torch==2.7.0",
+]
+
+[project.scripts]
+gpc-fsq = "gpc_fsq_sac.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gpc_fsq_sac"]
+
+[tool.uv]
+required-version = ">=0.11.32"
+environments = [
+  "sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
+index-strategy = "first-index"
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+protomotions = { git = "https://github.com/carlosdp/ProtoMotions.git", rev = "7fd6d2a82d2cf6953307acc92f021d68231ea89d", lfs = true }
+rsl-rl-lib = { git = "https://github.com/leggedrobotics/rsl_rl_sac.git", rev = "e0d243aa6d3f8a7231783b7f3cefeaec1b4a5521" }
+torch = { index = "pytorch-cu128" }
+
+[tool.uv.extra-build-variables]
+openmesh = { CMAKE_POLICY_VERSION_MINIMUM = "3.5" }
+
+[dependency-groups]
+dev = [
+  "build>=1.2,<2",
+  "pytest>=8.3,<9",
+  "ruff>=0.11,<0.12",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
