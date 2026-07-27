@@ -116,6 +116,113 @@ class FSQSACAgent(BaseAgent):
             policy_frequency=self.config.policy_frequency,
             n_steps=self.config.n_steps,
         )
+        self._diagnostic_batch = None
+
+    @staticmethod
+    def _gradient_norm(parameters) -> torch.Tensor:
+        gradients = [
+            parameter.grad.detach().norm(2)
+            for parameter in parameters
+            if parameter.grad is not None
+        ]
+        if not gradients:
+            return torch.tensor(0.0)
+        return torch.stack(gradients).norm(2)
+
+    def _maybe_create_diagnostic_batch(self) -> None:
+        if self._diagnostic_batch is not None:
+            return
+        replay_buffer = self.algorithm.replay_buffer
+        transitions = replay_buffer.num_transitions * self.num_envs
+        minimum = max(
+            self.config.diagnostic_batch_size,
+            self.config.n_steps * self.num_envs,
+        )
+        if transitions < minimum:
+            return
+        valid_indices = replay_buffer._generate_valid_indices()
+        self._diagnostic_batch = replay_buffer._generate_batch(
+            valid_indices,
+            self.config.diagnostic_batch_size,
+        )
+        cpu_batch = [
+            value.detach().cpu()
+            if isinstance(value, torch.Tensor)
+            else value.detach().cpu()
+            for value in self._diagnostic_batch
+        ]
+        torch.save(cpu_batch, self.root_dir / "diagnostic_batch.pt")
+
+    def _sac_diagnostics(self) -> dict[str, torch.Tensor]:
+        self._maybe_create_diagnostic_batch()
+        if self._diagnostic_batch is None:
+            return {}
+
+        (
+            obs_batch,
+            actions_batch,
+            rewards_batch,
+            next_obs_batch,
+            dones_batch,
+            bootstrap_batch,
+            effective_n_steps,
+        ) = self._diagnostic_batch
+        with torch.no_grad():
+            new_actions, log_prob = self.model.actor.sample_action_logp(obs_batch)
+            q1, q2 = self.model.critic.evaluate_all_q(obs_batch, new_actions)
+
+            next_actions, next_log_prob = self.model.actor.sample_action_logp(
+                next_obs_batch
+            )
+            target_q1, target_q2 = self.model.critic.evaluate_all_target_q(
+                next_obs_batch,
+                next_actions,
+            )
+            bootstrap_mask = bootstrap_batch + 1 - dones_batch
+            discount = torch.pow(
+                self.config.gamma,
+                effective_n_steps.to(dtype=target_q1.dtype),
+            )
+            target_q = rewards_batch + discount * bootstrap_mask * (
+                torch.minimum(target_q1, target_q2)
+                - self.algorithm.log_alpha.exp() * next_log_prob
+            )
+            data_q1, data_q2 = self.model.critic.evaluate_all_q(
+                obs_batch,
+                actions_batch,
+            )
+            td_error = 0.5 * (
+                (data_q1 - target_q).abs() + (data_q2 - target_q).abs()
+            )
+
+        return {
+            "sac_diag/log_prob_mean": log_prob.mean(),
+            "sac_diag/entropy_mean": -log_prob.mean(),
+            "sac_diag/q1_mean": q1.mean(),
+            "sac_diag/q2_mean": q2.mean(),
+            "sac_diag/q_abs_max": torch.maximum(q1.abs().max(), q2.abs().max()),
+            "sac_diag/critic_disagreement": (q1 - q2).abs().mean(),
+            "sac_diag/target_q_mean": target_q.mean(),
+            "sac_diag/target_q_std": target_q.std(),
+            "sac_diag/td_error_mean": td_error.mean(),
+            "sac_diag/td_error_max": td_error.max(),
+            "sac_diag/sampled_action_abs_mean": new_actions.abs().mean(),
+            "sac_diag/sampled_action_saturation": (
+                new_actions.abs() > 0.95
+            ).float().mean(),
+            "sac_diag/actor_reference_mse": (
+                self.model.critic.actor_reference_mse(
+                    self.model.actor,
+                    obs_batch,
+                )
+            ),
+            "grad/actor_global_norm": self._gradient_norm(
+                self.algorithm.actor_parameters
+            ),
+            "grad/critic_global_norm": self._gradient_norm(
+                self.algorithm.critic_parameters
+            ),
+        }
 
     def max_num_batches(self) -> int:
         # BaseAgent uses this during construction only to validate DDP parity.
@@ -185,6 +292,9 @@ class FSQSACAgent(BaseAgent):
         losses: dict,
         rewards: list[torch.Tensor],
         obs_td: TensorDict,
+        epoch_counts: dict[str, int],
+        updated: bool,
+        actor_updated: bool,
     ) -> None:
         end_time = time.time()
         episode_rewards = self.episode_reward_meter.mean_and_clear()
@@ -211,6 +321,27 @@ class FSQSACAgent(BaseAgent):
                 self.algorithm.replay_buffer.num_transitions * self.num_envs
             ),
             "replay/capacity": float(self.replay_profile["effective_transitions"]),
+            "replay/occupancy": float(
+                self.algorithm.replay_buffer.num_transitions * self.num_envs
+            )
+            / self.replay_profile["effective_transitions"],
+            "replay/configured_utd": (
+                self.config.num_learning_epochs
+                * self.config.num_mini_batches
+                * self.config.mini_batch_size
+            )
+            / (self.num_steps * self.num_envs),
+            "replay/warmup_transitions": float(
+                self.config.replay_warmup_transitions
+            ),
+            "optimization/enabled": float(updated),
+            "optimization/actor_enabled": float(actor_updated),
+            "terminations/done_rate": epoch_counts["dones"]
+            / (self.num_steps * self.num_envs),
+            "terminations/failure_rate": epoch_counts["terminated"]
+            / (self.num_steps * self.num_envs),
+            "terminations/timeout_rate": epoch_counts["timeouts"]
+            / (self.num_steps * self.num_envs),
             "times/fps_last_epoch": (
                 self.num_steps * self.get_step_count_increment()
             )
@@ -226,6 +357,9 @@ class FSQSACAgent(BaseAgent):
             }
         )
         log_dict.update(self.model.actor.fsq_diagnostics(obs_td))
+        log_dict.update(self.model.actor.policy_diagnostics(obs_td))
+        if self.current_epoch % self.config.diagnostic_every == 0:
+            log_dict.update(self._sac_diagnostics())
         log_dict.update(
             {f"env/{key}": value for key, value in self.episode_env_tensors.mean_and_clear().items()}
         )
@@ -242,7 +376,15 @@ class FSQSACAgent(BaseAgent):
             {
                 "score": score,
                 "num_evaluated": num_items,
-                "fixed_order_motion_ids": list(range(num_items)),
+                "fixed_order_motion_ids": (
+                    list(self.evaluator.config.evaluation_motion_ids)
+                    if getattr(
+                        self.evaluator.config,
+                        "evaluation_motion_ids",
+                        None,
+                    )
+                    else list(range(num_items))
+                ),
                 "epoch": self.current_epoch,
                 "step_count": self.step_count,
             }
@@ -262,6 +404,7 @@ class FSQSACAgent(BaseAgent):
         while self.current_epoch < self.max_epochs:
             self.epoch_start_time = time.time()
             rewards_for_log: list[torch.Tensor] = []
+            epoch_counts = {"dones": 0, "terminated": 0, "timeouts": 0}
             for step in range(self.num_steps):
                 obs, _ = self.env.reset(done_indices)
                 self.pre_collect_step(step)
@@ -283,6 +426,9 @@ class FSQSACAgent(BaseAgent):
                 )
                 done_indices = dones.nonzero(as_tuple=False).flatten()
                 timeouts = dones.bool() & ~terminated.bool()
+                epoch_counts["dones"] += int(dones.sum().item())
+                epoch_counts["terminated"] += int(terminated.sum().item())
+                epoch_counts["timeouts"] += int(timeouts.sum().item())
                 sac_extras = {
                     "time_outs": timeouts.unsqueeze(-1),
                     "time_outs_obs": next_obs_td.clone(),
@@ -299,11 +445,46 @@ class FSQSACAgent(BaseAgent):
                 obs_td = next_obs_td
 
             losses = {}
-            if self.current_epoch >= self.config.start_training_epoch:
-                losses = self.algorithm.update()
+            replay_transitions = (
+                self.algorithm.replay_buffer.num_transitions * self.num_envs
+            )
+            updated = (
+                self.current_epoch >= self.config.start_training_epoch
+                and replay_transitions >= self.config.replay_warmup_transitions
+            )
+            actor_updated = (
+                updated
+                and self.current_epoch
+                >= self.config.actor_start_training_epoch
+            )
+            if updated:
+                original_policy_frequency = self.algorithm.policy_frequency
+                original_auto_alpha = self.algorithm.auto_alpha
+                if not actor_updated:
+                    if self.algorithm.update_step == 0:
+                        self.algorithm.update_step = 1
+                    self.algorithm.policy_frequency = 1_000_000_000
+                    self.algorithm.auto_alpha = False
+                try:
+                    losses = self.algorithm.update()
+                finally:
+                    self.algorithm.policy_frequency = original_policy_frequency
+                    self.algorithm.auto_alpha = original_auto_alpha
+                if actor_updated:
+                    self.model.critic.update_actor_reference(
+                        self.model.actor,
+                        self.config.model.actor_reference_tau,
+                    )
 
             self.current_epoch += 1
-            self._log_epoch(losses, rewards_for_log, obs_td)
+            self._log_epoch(
+                losses,
+                rewards_for_log,
+                obs_td,
+                epoch_counts,
+                updated,
+                actor_updated,
+            )
             self.fabric.call("after_train", self)
 
             if (

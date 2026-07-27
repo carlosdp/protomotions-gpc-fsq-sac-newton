@@ -12,6 +12,7 @@ from importlib import resources
 from pathlib import Path
 
 from .constants import (
+    MOTION_COUNT,
     DEFAULT_NUM_ENVS,
     DEFAULT_ROLLOUT_STEPS,
     DEFAULT_TARGET_ENTROPY_SCALE,
@@ -75,13 +76,68 @@ def build_train_command(args: argparse.Namespace) -> list[str]:
         command.append("--use-wandb")
     overrides = list(args.overrides)
     if args.algorithm == "sac":
+        if args.sac_no_fsq and args.sac_ppo_actor_checkpoint is not None:
+            raise ValueError(
+                "--sac-no-fsq cannot be combined with --sac-ppo-actor-checkpoint"
+            )
         overrides.extend(
             [
                 f"agent.target_entropy_scale={args.target_entropy_scale}",
                 f"agent.replay_buffer_size={args.replay_buffer_size}",
                 f"agent.replay_memory_limit_gib={args.replay_memory_limit_gib}",
+                f"agent.replay_warmup_transitions={args.replay_warmup_transitions}",
+                f"agent.actor_start_training_epoch={args.sac_actor_start_epoch}",
+                f"agent.num_mini_batches={args.sac_num_mini_batches}",
+                f"agent.policy_frequency={args.sac_policy_frequency}",
+                f"agent.actor_learning_rate={args.sac_actor_learning_rate}",
+                f"agent.critic_learning_rate={args.sac_critic_learning_rate}",
+                f"agent.diagnostic_batch_size={args.sac_diagnostic_batch_size}",
+                f"agent.diagnostic_every={args.sac_diagnostic_every}",
+                f"agent.model.min_log_std={args.sac_min_log_std}",
+                f"agent.model.max_log_std={args.sac_max_log_std}",
+                f"agent.model.actor_trust_region_coef={args.sac_actor_trust_region_coef}",
+                f"agent.model.actor_reference_tau={args.sac_actor_reference_tau}",
             ]
         )
+        if args.sac_fixed_std is not None:
+            overrides.extend(
+                [
+                    f"agent.model.initial_std={args.sac_fixed_std}",
+                    "agent.model.learn_std=false",
+                ]
+            )
+        if args.sac_no_fsq:
+            overrides.append("agent.model.use_fsq=false")
+        if args.sac_ppo_actor_checkpoint is not None:
+            checkpoint = args.sac_ppo_actor_checkpoint.expanduser().resolve()
+            overrides.extend(
+                [
+                    "agent.model.ppo_compatible_normalization=true",
+                    f"agent.model.ppo_actor_checkpoint={checkpoint}",
+                ]
+            )
+        if args.sac_freeze_normalization:
+            overrides.append("agent.model.freeze_normalization=true")
+        if args.sac_tracking_termination_threshold is not None:
+            overrides.append(
+                "env.termination_components.tracking_error.static_params.threshold="
+                f"{args.sac_tracking_termination_threshold}"
+            )
+    overrides.append(f"agent.evaluator.eval_metrics_every={args.eval_every}")
+    if args.train_motion_id is not None:
+        excluded = [
+            motion_id
+            for motion_id in range(MOTION_COUNT)
+            if motion_id != args.train_motion_id
+        ]
+        overrides.extend(
+            [
+                f"env.motion_manager.exclude_motion_ids={excluded}",
+                f"agent.evaluator.evaluation_motion_ids=[{args.train_motion_id}]",
+            ]
+        )
+    if args.fixed_starts:
+        overrides.append("env.motion_manager.init_start_prob=1.0")
     if overrides:
         command.extend(["--overrides", *overrides])
     return command
@@ -179,6 +235,26 @@ def create_parser() -> argparse.ArgumentParser:
     train.add_argument("--target-entropy-scale", type=float, default=DEFAULT_TARGET_ENTROPY_SCALE)
     train.add_argument("--replay-buffer-size", type=int, default=262_144)
     train.add_argument("--replay-memory-limit-gib", type=float, default=9.0)
+    train.add_argument("--replay-warmup-transitions", type=int, default=0)
+    train.add_argument("--sac-actor-start-epoch", type=int, default=0)
+    train.add_argument("--sac-num-mini-batches", type=int, default=13)
+    train.add_argument("--sac-policy-frequency", type=int, default=1)
+    train.add_argument("--sac-actor-learning-rate", type=float, default=2e-4)
+    train.add_argument("--sac-critic-learning-rate", type=float, default=2e-4)
+    train.add_argument("--sac-fixed-std", type=float)
+    train.add_argument("--sac-no-fsq", action="store_true")
+    train.add_argument("--sac-ppo-actor-checkpoint", type=Path)
+    train.add_argument("--sac-freeze-normalization", action="store_true")
+    train.add_argument("--sac-tracking-termination-threshold", type=float)
+    train.add_argument("--sac-min-log-std", type=float, default=-20.0)
+    train.add_argument("--sac-max-log-std", type=float, default=2.0)
+    train.add_argument("--sac-actor-trust-region-coef", type=float, default=0.0)
+    train.add_argument("--sac-actor-reference-tau", type=float, default=0.01)
+    train.add_argument("--sac-diagnostic-batch-size", type=int, default=1024)
+    train.add_argument("--sac-diagnostic-every", type=int, default=10)
+    train.add_argument("--eval-every", type=int, default=200)
+    train.add_argument("--train-motion-id", type=int, choices=range(MOTION_COUNT))
+    train.add_argument("--fixed-starts", action="store_true")
     train.add_argument("--overrides", nargs="*", default=[])
     train.add_argument("--print-command", action="store_true")
 

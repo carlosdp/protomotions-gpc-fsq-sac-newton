@@ -79,7 +79,7 @@ The fetch is pinned and verifies:
 
 Data is written beneath ignored `data/`; it is never committed by this project.
 
-## Train SAC
+## Convergent SAC fine-tuning
 
 Authenticate W&B without putting a secret in the repository:
 
@@ -87,7 +87,43 @@ Authenticate W&B without putting a secret in the repository:
 uv run wandb login
 ```
 
-Start SAC:
+Direct, from-scratch SAC is available for controlled ablations, but it does not
+reliably discover this high-dimensional tracker under the strict 0.5 m termination.
+The validated convergent path initializes the exact FSQ actor and its normalization
+statistics from a trained matched PPO-FSQ checkpoint, fills replay, trains the critic
+alone for 100 iterations, and then enables SAC actor updates with a slowly moving
+behavior-policy trust region.
+
+```bash
+ITERATIONS=500 scripts/run_converged_sac.sh \
+  results/soma23_bones_seed_mini_fsq_ppo_seed0/last.ckpt
+```
+
+This is SAC fine-tuning, not evidence that SAC learns the tracker from a random
+initialization and not a corpus-scale GPC reproduction. The twin-Q targets and critic
+updates remain those of the released learner. During actor-only Q evaluation, the
+integration subtracts `500 * mean((action - reference_action)^2)` from Q. The
+reference is an exponential moving average of the trained behavior actor
+(`tau=0.001`). This keeps actor proposals in the replay-supported action neighborhood
+on every sampled state. The PPO-loaded normalizers remain frozen.
+
+The validated recipe uses 512 environments, 24 collection steps, 5-step targets,
+discount `0.97`, target smoothing `0.003`, four SAC minibatches of 8,192 samples,
+fixed ProtoMotions-style vector standard deviation `0.055`, actor/critic learning
+rates `1e-4`, and fixed temperature `0.001`. It fills all 262,144 replay transitions
+and delays actor updates until iteration 100.
+
+The seed-0 validation ran for 500 iterations (6,144,000 environment interactions)
+and finished at 51/61 successful fixed-order motions (`83.61%`), matching the source
+PPO checkpoint; iterations 200 and 300 reached 52/61 (`85.25%`). At iteration 500,
+FSQ perplexity was `6.52`, mean completed episode length was `70.29`, and the actor
+had a `6.31%` relative L2 parameter change from PPO across the encoder and decoder.
+This demonstrates stable SAC updates without tracker/codebook collapse. It does not
+establish superiority over PPO or random-initialization convergence.
+
+## From-scratch SAC ablations
+
+Run the released SAC baseline without a warm start:
 
 ```bash
 uv run gpc-fsq train sac \
@@ -98,10 +134,8 @@ uv run gpc-fsq train sac \
 ```
 
 The baseline target-entropy scale is `0.167`; `0.5` is intentionally reserved for a
-later ablation. The released settings retained here include 24 collection steps,
-5-step targets, discount `0.97`, target smoothing `0.003`, 200 SAC minibatches of
-8,192 samples, actor/critic learning rates `2e-4`, and temperature learning rate
-`2e-5`.
+later ablation. This path is retained to reproduce the failure mode and test future
+improvements; it is not the recommended training recipe.
 
 Before allocating replay, the agent writes `replay_profile.json` with actual observation
 dimensions, byte cost, requested/effective capacity, and GPU allocation. The default
@@ -172,3 +206,29 @@ Newton transitions, populate the released replay buffer, execute finite twin-Q, 
 and temperature updates, save a reloadable checkpoint, and complete a fixed-order
 61-motion evaluation. The PPO comparison must begin from a fresh run and finish with the
 same environment-interaction count.
+
+## Focused SAC convergence diagnostics
+
+Use a single fixture motion to diagnose SAC before spending a full-corpus budget:
+
+```bash
+uv run gpc-fsq train sac \
+  --num-envs 512 \
+  --training-steps 6144000 \
+  --train-motion-id 43 \
+  --fixed-starts \
+  --sac-fixed-std 0.055 \
+  --replay-warmup-transitions 262144 \
+  --sac-num-mini-batches 2 \
+  --sac-policy-frequency 2 \
+  --eval-every 100 \
+  --use-wandb
+```
+
+This retains the released SAC learner while fixing the ProtoMotions-style vector
+standard deviation at the PPO baseline, filling replay before optimization, and
+reducing the configured update-to-data ratio from about 8.67 to 1.33. W&B includes
+policy standard-deviation and saturation, entropy, twin-Q/target-Q/TD-error,
+gradient-norm, replay-occupancy, timeout, failure, reward-component, and focused
+evaluation metrics. `scripts/run_convergence_probes.sh` runs the current, fixed-std,
+replay-only, and combined variants sequentially on fixture motion 43.

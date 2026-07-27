@@ -11,7 +11,12 @@ apply_inference_overrides = task.apply_inference_overrides
 
 def env_config(robot_cfg, args):
     # SAC already applies its tanh squash. The environment must not apply a second tanh.
-    return task.build_env_config(robot_cfg, action_transform=None)
+    return task.build_env_config(
+        robot_cfg,
+        action_transform=None,
+        train_motion_id=getattr(args, "train_motion_id", None),
+        fixed_starts=getattr(args, "fixed_starts", False),
+    )
 
 
 def agent_config(robot_config, env_config, args):

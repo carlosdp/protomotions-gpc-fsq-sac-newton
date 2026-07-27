@@ -16,10 +16,19 @@ class FSQSACModelConfig(BaseModelConfig):
     out_keys: list[str] = field(default_factory=lambda: ["action", "mean_action"])
     num_fsq_levels: int = 9
     num_fsq_scalars: int = 40
+    use_fsq: bool = True
+    ppo_compatible_normalization: bool = False
+    freeze_normalization: bool = False
+    ppo_actor_checkpoint: str | None = None
     encoder_hidden_dims: tuple[int, ...] = (1024, 1024, 1024, 512, 256)
     decoder_hidden_dims: tuple[int, ...] = (1024, 1024, 1024, 512, 256)
     critic_hidden_dims: tuple[int, ...] = (1024, 1024, 1024, 1024)
     initial_std: float = 0.15
+    learn_std: bool = True
+    min_log_std: float = -20.0
+    max_log_std: float = 2.0
+    actor_trust_region_coef: float = 0.0
+    actor_reference_tau: float = 0.01
     normalize_observations: bool = True
     normalization_clip: float = 5.0
 
@@ -39,6 +48,8 @@ class FSQSACAgentConfig(BaseAgentConfig):
     num_mini_batches: int = 200
     mini_batch_size: int = 8192
     start_training_epoch: int = 1
+    replay_warmup_transitions: int = 0
+    actor_start_training_epoch: int = 0
     actor_learning_rate: float = 2e-4
     critic_learning_rate: float = 2e-4
     alpha_learning_rate: float = 2e-5
@@ -49,7 +60,8 @@ class FSQSACAgentConfig(BaseAgentConfig):
     policy_frequency: int = 1
     max_grad_norm: float = 1.0
     checkpoint_replay_buffer: bool = False
+    diagnostic_batch_size: int = 1024
+    diagnostic_every: int = 10
     save_last_checkpoint_every: int = 20
     save_epoch_checkpoint_every: int | None = 200
     save_inference_checkpoint: bool = True
-

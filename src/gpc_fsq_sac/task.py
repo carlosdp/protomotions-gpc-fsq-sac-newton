@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 
+from .constants import MOTION_COUNT
+
 from protomotions.envs.base_env.config import EnvConfig
 from protomotions.robot_configs.base import RobotConfig
 from protomotions.simulator.base_simulator.config import SimulatorConfig
@@ -32,6 +34,8 @@ def build_env_config(
     robot_cfg: RobotConfig,
     *,
     action_transform: str | None,
+    train_motion_id: int | None = None,
+    fixed_starts: bool = False,
 ) -> EnvConfig:
     from protomotions.envs.action import make_pd_action_config
     from protomotions.envs.component_factories import (
@@ -89,8 +93,17 @@ def build_env_config(
             action_transform=action_transform,
         ),
         motion_manager=MimicMotionManagerConfig(
-            init_start_prob=0.2,
+            init_start_prob=1.0 if fixed_starts else 0.2,
             resample_on_reset=True,
+            exclude_motion_ids=(
+                [
+                    motion_id
+                    for motion_id in range(MOTION_COUNT)
+                    if motion_id != train_motion_id
+                ]
+                if train_motion_id is not None
+                else None
+            ),
         ),
     )
 
@@ -110,9 +123,11 @@ def configure_robot_and_simulator(
     robot_cfg.simulation_params.newton.njmax = 1024
 
 
-def evaluator_config(eval_metrics_every: int):
+def evaluator_config(
+    eval_metrics_every: int,
+    evaluation_motion_ids: list[int] | None = None,
+):
     from protomotions.agents.evaluators.config import (
-        MimicEvaluatorConfig,
         MotionWeightsRulesConfig,
     )
     from protomotions.envs.component_factories import (
@@ -121,9 +136,12 @@ def evaluator_config(eval_metrics_every: int):
         max_joint_error_factory,
     )
 
-    return MimicEvaluatorConfig(
+    from .evaluator import NewtonMimicEvaluatorConfig
+
+    return NewtonMimicEvaluatorConfig(
         _target_="gpc_fsq_sac.evaluator.NewtonMimicEvaluator",
         eval_metrics_every=eval_metrics_every,
+        evaluation_motion_ids=evaluation_motion_ids or [],
         save_predicted_motion_lib_every=None,
         evaluation_components={
             "gt_error": gt_error_factory(threshold=0.5),
@@ -144,12 +162,33 @@ def build_sac_agent_config(
     from .config import FSQSACAgentConfig, FSQSACModelConfig
 
     return FSQSACAgentConfig(
-        model=FSQSACModelConfig(),
+        model=FSQSACModelConfig(
+            initial_std=getattr(args, "sac_fixed_std", None) or 0.15,
+            learn_std=getattr(args, "sac_fixed_std", None) is None,
+            min_log_std=getattr(args, "sac_min_log_std", -20.0),
+            max_log_std=getattr(args, "sac_max_log_std", 2.0),
+        ),
         batch_size=args.batch_size,
         training_max_steps=args.training_max_steps,
         replay_buffer_size=getattr(args, "sac_replay_buffer_size", 262_144),
+        replay_warmup_transitions=getattr(
+            args,
+            "sac_replay_warmup_transitions",
+            0,
+        ),
+        num_mini_batches=getattr(args, "sac_num_mini_batches", 13),
+        policy_frequency=getattr(args, "sac_policy_frequency", 1),
         target_entropy_scale=getattr(args, "sac_target_entropy_scale", 0.167),
-        evaluator=evaluator_config(eval_metrics_every=200),
+        diagnostic_batch_size=getattr(args, "sac_diagnostic_batch_size", 1024),
+        diagnostic_every=getattr(args, "sac_diagnostic_every", 10),
+        evaluator=evaluator_config(
+            eval_metrics_every=getattr(args, "eval_every", 200),
+            evaluation_motion_ids=(
+                [args.eval_motion_id]
+                if getattr(args, "eval_motion_id", None) is not None
+                else []
+            ),
+        ),
     )
 
 
@@ -245,7 +284,14 @@ def build_ppo_agent_config(
         gradient_clip_val=50.0,
         clip_critic_loss=True,
         save_inference_checkpoint=True,
-        evaluator=evaluator_config(eval_metrics_every=200),
+        evaluator=evaluator_config(
+            eval_metrics_every=getattr(args, "eval_every", 200),
+            evaluation_motion_ids=(
+                [args.eval_motion_id]
+                if getattr(args, "eval_motion_id", None) is not None
+                else []
+            ),
+        ),
         advantage_normalization=AdvantageNormalizationConfig(
             enabled=True,
             shift_mean=True,
@@ -264,7 +310,9 @@ def apply_inference_overrides(
     scene_lib_cfg,
     args,
 ):
-    del robot_cfg, simulator_cfg, agent_cfg, terrain_cfg, motion_lib_cfg, scene_lib_cfg, args
+    del robot_cfg, simulator_cfg, terrain_cfg, motion_lib_cfg, scene_lib_cfg, args
+    if hasattr(agent_cfg.model, "ppo_actor_checkpoint"):
+        agent_cfg.model.ppo_actor_checkpoint = None
     env_cfg.termination_components = {}
     env_cfg.max_episode_length = 1_000_000
     env_cfg.motion_manager.resample_on_reset = True

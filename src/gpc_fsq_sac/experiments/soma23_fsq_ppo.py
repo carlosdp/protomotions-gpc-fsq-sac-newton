@@ -11,7 +11,12 @@ apply_inference_overrides = task.apply_inference_overrides
 
 def env_config(robot_cfg, args):
     # Public ProtoMotions PPO emits an unsquashed Gaussian action; the task applies tanh once.
-    return task.build_env_config(robot_cfg, action_transform="tanh")
+    return task.build_env_config(
+        robot_cfg,
+        action_transform="tanh",
+        train_motion_id=getattr(args, "train_motion_id", None),
+        fixed_starts=getattr(args, "fixed_starts", False),
+    )
 
 
 def agent_config(robot_config, env_config, args):
