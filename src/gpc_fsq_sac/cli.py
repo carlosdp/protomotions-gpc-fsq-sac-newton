@@ -72,13 +72,35 @@ def build_train_command(args: argparse.Namespace) -> list[str]:
         "--headless",
         "true",
     ]
+    if args.checkpoint is not None:
+        command.extend(
+            [
+                "--checkpoint",
+                str(args.checkpoint.expanduser().resolve()),
+            ]
+        )
     if args.use_wandb:
         command.append("--use-wandb")
+    if args.algorithm == "sac" and args.sac_disable_tracking_termination:
+        command.append("--sac-disable-tracking-termination")
+    if (
+        args.algorithm == "sac"
+        and args.sac_tracking_termination_threshold is not None
+    ):
+        command.extend(
+            [
+                "--sac-tracking-termination-threshold",
+                str(args.sac_tracking_termination_threshold),
+            ]
+        )
     overrides = list(args.overrides)
     if args.algorithm == "sac":
-        if args.sac_no_fsq and args.sac_ppo_actor_checkpoint is not None:
+        if (
+            args.sac_fixed_std is not None
+            and args.sac_fixed_physical_std is not None
+        ):
             raise ValueError(
-                "--sac-no-fsq cannot be combined with --sac-ppo-actor-checkpoint"
+                "--sac-fixed-std and --sac-fixed-physical-std are mutually exclusive"
             )
         overrides.extend(
             [
@@ -87,18 +109,53 @@ def build_train_command(args: argparse.Namespace) -> list[str]:
                 f"agent.replay_memory_limit_gib={args.replay_memory_limit_gib}",
                 f"agent.replay_warmup_transitions={args.replay_warmup_transitions}",
                 f"agent.actor_start_training_epoch={args.sac_actor_start_epoch}",
+                "agent.reset_alpha_on_load="
+                f"{str(args.sac_reset_alpha_on_load).lower()}",
                 f"agent.num_mini_batches={args.sac_num_mini_batches}",
                 f"agent.policy_frequency={args.sac_policy_frequency}",
                 f"agent.actor_learning_rate={args.sac_actor_learning_rate}",
                 f"agent.critic_learning_rate={args.sac_critic_learning_rate}",
+                f"agent.conservative_q_coef={args.sac_conservative_q_coef}",
+                "agent.conservative_q_batch_size="
+                f"{args.sac_conservative_q_batch_size}",
                 f"agent.diagnostic_batch_size={args.sac_diagnostic_batch_size}",
                 f"agent.diagnostic_every={args.sac_diagnostic_every}",
                 f"agent.model.min_log_std={args.sac_min_log_std}",
                 f"agent.model.max_log_std={args.sac_max_log_std}",
+                "agent.model.reset_std_on_load="
+                f"{str(args.sac_reset_std_on_load).lower()}",
                 f"agent.model.actor_trust_region_coef={args.sac_actor_trust_region_coef}",
                 f"agent.model.actor_reference_tau={args.sac_actor_reference_tau}",
+                "agent.model.action_bounds_from_motion="
+                f"{str(args.sac_action_bounds_from_motion).lower()}",
+                "agent.model.action_bounds_margin="
+                f"{args.sac_action_bounds_margin}",
+                "agent.model.action_bounds_symmetric="
+                f"{str(args.sac_action_bounds_symmetric).lower()}",
+                "agent.model.reference_residual_actions="
+                f"{str(args.sac_reference_residual_actions).lower()}",
+                "agent.model.reference_residual_action_scale="
+                f"{args.sac_reference_residual_action_scale}",
+                "agent.model.reference_action_gain="
+                f"{args.sac_reference_action_gain}",
+                "agent.model.reference_action_time_offset_steps="
+                f"{args.sac_reference_action_time_offset_steps}",
             ]
         )
+        if args.sac_action_bounds_train_motion_only:
+            if not args.sac_action_bounds_from_motion:
+                raise ValueError(
+                    "--sac-action-bounds-train-motion-only requires "
+                    "--sac-action-bounds-from-motion"
+                )
+            if args.train_motion_id is None:
+                raise ValueError(
+                    "--sac-action-bounds-train-motion-only requires "
+                    "--train-motion-id"
+                )
+            overrides.append(
+                f"agent.model.action_bounds_motion_id={args.train_motion_id}"
+            )
         if args.sac_fixed_std is not None:
             overrides.extend(
                 [
@@ -106,23 +163,33 @@ def build_train_command(args: argparse.Namespace) -> list[str]:
                     "agent.model.learn_std=false",
                 ]
             )
-        if args.sac_no_fsq:
-            overrides.append("agent.model.use_fsq=false")
-        if args.sac_ppo_actor_checkpoint is not None:
-            checkpoint = args.sac_ppo_actor_checkpoint.expanduser().resolve()
+        if args.sac_fixed_physical_std is not None:
+            if not (
+                args.sac_action_bounds_from_motion
+                or args.sac_reference_residual_actions
+            ):
+                raise ValueError(
+                    "--sac-fixed-physical-std requires "
+                    "--sac-action-bounds-from-motion or "
+                    "--sac-reference-residual-actions"
+                )
             overrides.extend(
                 [
-                    "agent.model.ppo_compatible_normalization=true",
-                    f"agent.model.ppo_actor_checkpoint={checkpoint}",
+                    "agent.model.physical_action_std="
+                    f"{args.sac_fixed_physical_std}",
+                    "agent.model.learn_std=false",
                 ]
             )
+        if args.sac_no_fsq:
+            overrides.append("agent.model.use_fsq=false")
         if args.sac_freeze_normalization:
             overrides.append("agent.model.freeze_normalization=true")
-        if args.sac_tracking_termination_threshold is not None:
-            overrides.append(
-                "env.termination_components.tracking_error.static_params.threshold="
-                f"{args.sac_tracking_termination_threshold}"
-            )
+        if args.sac_disable_tracking_termination:
+            if args.sac_tracking_termination_threshold is not None:
+                raise ValueError(
+                    "--sac-disable-tracking-termination and "
+                    "--sac-tracking-termination-threshold are mutually exclusive"
+                )
     overrides.append(f"agent.evaluator.eval_metrics_every={args.eval_every}")
     if args.train_motion_id is not None:
         excluded = [
@@ -158,6 +225,9 @@ def build_eval_command(args: argparse.Namespace) -> list[str]:
         "61",
         "--motion-file",
         str(args.motion_file.expanduser().resolve()),
+        "--overrides",
+        "agent.evaluator.evaluation_motion_ids=[]",
+        "agent.evaluator.progressive_seed_motion_ids=[]",
     ]
 
 
@@ -231,25 +301,80 @@ def create_parser() -> argparse.ArgumentParser:
     train.add_argument("--training-steps", type=int, default=DEFAULT_TRAINING_STEPS)
     train.add_argument("--seed", type=int, default=0)
     train.add_argument("--experiment-name")
+    train.add_argument(
+        "--checkpoint",
+        type=Path,
+        help="Warm-start from an earlier checkpoint of the same algorithm.",
+    )
     train.add_argument("--use-wandb", action="store_true")
     train.add_argument("--target-entropy-scale", type=float, default=DEFAULT_TARGET_ENTROPY_SCALE)
     train.add_argument("--replay-buffer-size", type=int, default=262_144)
     train.add_argument("--replay-memory-limit-gib", type=float, default=9.0)
     train.add_argument("--replay-warmup-transitions", type=int, default=0)
     train.add_argument("--sac-actor-start-epoch", type=int, default=0)
+    train.add_argument("--sac-reset-alpha-on-load", action="store_true")
     train.add_argument("--sac-num-mini-batches", type=int, default=13)
     train.add_argument("--sac-policy-frequency", type=int, default=1)
     train.add_argument("--sac-actor-learning-rate", type=float, default=2e-4)
     train.add_argument("--sac-critic-learning-rate", type=float, default=2e-4)
+    train.add_argument("--sac-conservative-q-coef", type=float, default=0.0)
+    train.add_argument("--sac-conservative-q-batch-size", type=int, default=8192)
     train.add_argument("--sac-fixed-std", type=float)
+    train.add_argument(
+        "--sac-fixed-physical-std",
+        type=float,
+        help=(
+            "Use a vector pre-tanh std that produces this approximate "
+            "physical-action std after calibrated action scaling."
+        ),
+    )
+    train.add_argument("--sac-reset-std-on-load", action="store_true")
+    train.add_argument(
+        "--sac-reference-residual-actions",
+        action="store_true",
+        help="Learn bounded corrections around the next reference DOF target.",
+    )
+    train.add_argument(
+        "--sac-reference-residual-action-scale",
+        type=float,
+        default=0.1,
+    )
+    train.add_argument(
+        "--sac-reference-action-gain",
+        type=float,
+        default=1.0,
+    )
+    train.add_argument(
+        "--sac-reference-action-time-offset-steps",
+        type=int,
+        default=1,
+    )
     train.add_argument("--sac-no-fsq", action="store_true")
-    train.add_argument("--sac-ppo-actor-checkpoint", type=Path)
     train.add_argument("--sac-freeze-normalization", action="store_true")
+    train.add_argument(
+        "--sac-disable-tracking-termination",
+        action="store_true",
+        help=(
+            "Collect recovery trajectories without the training-time tracking "
+            "error termination. Evaluation thresholds are unchanged."
+        ),
+    )
     train.add_argument("--sac-tracking-termination-threshold", type=float)
     train.add_argument("--sac-min-log-std", type=float, default=-20.0)
     train.add_argument("--sac-max-log-std", type=float, default=2.0)
     train.add_argument("--sac-actor-trust-region-coef", type=float, default=0.0)
     train.add_argument("--sac-actor-reference-tau", type=float, default=0.01)
+    train.add_argument("--sac-action-bounds-from-motion", action="store_true")
+    train.add_argument(
+        "--sac-action-bounds-train-motion-only",
+        action="store_true",
+    )
+    train.add_argument("--sac-action-bounds-margin", type=float, default=0.05)
+    train.add_argument(
+        "--sac-action-bounds-symmetric",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     train.add_argument("--sac-diagnostic-batch-size", type=int, default=1024)
     train.add_argument("--sac-diagnostic-every", type=int, default=10)
     train.add_argument("--eval-every", type=int, default=200)

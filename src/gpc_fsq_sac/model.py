@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import copy
-import logging
 import math
-from pathlib import Path
 
 import torch
 from rsl_rl.models import SACCriticModel
@@ -16,46 +14,188 @@ from torch.distributions import Normal
 
 from protomotions.agents.base_agent.model import BaseModel
 from protomotions.agents.common.fsq import FiniteScalarQuantizer
-from protomotions.agents.utils.normalization import RunningMeanStd
-
 from .config import FSQSACModelConfig
 
-log = logging.getLogger(__name__)
-
-
 class TrustRegionSACCritic(SACCriticModel):
-    """Apply a slowly moving behavior-policy anchor only to SAC actor gradients."""
+    """Apply SAC's own slowly moving behavior anchor only to actor gradients.
+
+    The reference is always copied from the randomly initialized SAC actor in
+    this process. There is no checkpoint-loading or teacher-policy path.
+    """
 
     def __init__(
         self,
         *args,
         actor_reference: nn.Module,
         actor_trust_region_coef: float,
+        actor_reference_motion_ids: list[int] | None,
+        reference_residual_actions: bool,
+        reference_action_gain: float,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self.actor_trust_region_coef = actor_trust_region_coef
+        self.actor_reference_motion_ids = tuple(actor_reference_motion_ids or ())
+        self.reference_residual_actions = reference_residual_actions
+        self.reference_action_gain = reference_action_gain
+        self.num_motion_heads = int(kwargs.get("output_dim", 1))
+        if self.num_motion_heads < 1:
+            raise ValueError("critic output_dim must be positive")
         self.actor_reference = copy.deepcopy(actor_reference)
         self.actor_reference.requires_grad_(False)
         self.actor_reference.eval()
+        self.register_buffer(
+            "critic_action_bias",
+            torch.zeros(actor_reference.output_dim),
+        )
+        self.register_buffer(
+            "critic_action_range",
+            torch.ones(actor_reference.output_dim),
+        )
+
+    @torch.no_grad()
+    def set_action_scaling(
+        self,
+        action_bias: torch.Tensor,
+        action_range: torch.Tensor,
+    ) -> None:
+        """Keep environment scaling out of the critic feature magnitude.
+
+        The actor emits calibrated environment actions. The released critic
+        concatenates actions with normalized observations, so feeding narrow
+        physical action ranges directly makes the critic effectively
+        action-blind. Map actions back to the actor's canonical ``[-1, 1]``
+        coordinates before every online and target Q evaluation.
+        """
+        self.critic_action_bias.copy_(action_bias)
+        self.critic_action_range.copy_(action_range)
+        self.actor_reference.action_bias.copy_(action_bias)
+        self.actor_reference.action_range.copy_(action_range)
+        self.actor_reference.log_action_range.copy_(
+            torch.log(action_range).sum()
+        )
+
+    def action_center(self, obs: TensorDict) -> torch.Tensor:
+        if self.reference_residual_actions:
+            if "sac_reference_action" not in obs.keys():
+                raise KeyError(
+                    "sac_reference_action is required for residual actions"
+                )
+            return self.critic_action_bias + self.reference_action_gain * (
+                obs["sac_reference_action"] - self.critic_action_bias
+            )
+        return self.critic_action_bias
+
+    def normalize_actions(
+        self,
+        obs: TensorDict,
+        actions: torch.Tensor,
+    ) -> torch.Tensor:
+        return (actions - self.action_center(obs)) / self.critic_action_range
+
+    def actor_reference_mask(self, obs: TensorDict) -> torch.Tensor:
+        """Select replay rows whose behavior should retain the SAC anchor."""
+        batch_size = obs.batch_size[0]
+        if not self.actor_reference_motion_ids:
+            return torch.ones(
+                batch_size,
+                1,
+                device=self.critic_action_bias.device,
+            )
+        if "sac_motion_id" not in obs.keys():
+            raise KeyError(
+                "sac_motion_id is required when actor_reference_motion_ids is set"
+            )
+        motion_ids = obs["sac_motion_id"].reshape(batch_size, -1)[:, 0].long()
+        reference_ids = torch.tensor(
+            self.actor_reference_motion_ids,
+            device=motion_ids.device,
+            dtype=motion_ids.dtype,
+        )
+        return (motion_ids[:, None] == reference_ids[None, :]).any(
+            dim=1,
+            keepdim=True,
+        ).to(dtype=self.critic_action_bias.dtype)
+
+    def select_motion_q(
+        self,
+        obs: TensorDict,
+        q_values: torch.Tensor,
+    ) -> torch.Tensor:
+        """Select the Q head for each replay row without exposing IDs to actor."""
+        if self.num_motion_heads == 1:
+            return q_values
+        if "sac_motion_id" not in obs.keys():
+            raise KeyError(
+                "sac_motion_id is required when critic_num_motion_heads > 1"
+            )
+        motion_ids = obs["sac_motion_id"].reshape(q_values.shape[0], -1)[
+            :, :1
+        ].long()
+        if torch.any(motion_ids < 0) or torch.any(
+            motion_ids >= self.num_motion_heads
+        ):
+            raise IndexError(
+                "sac_motion_id is outside the configured critic head range"
+            )
+        return q_values.gather(dim=-1, index=motion_ids)
+
+    def forward(
+        self,
+        obs: TensorDict,
+        masks=None,
+        hidden_state=None,
+        stochastic_output: bool = False,
+        actions: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if actions is None:
+            raise ValueError("SAC critic requires actions")
+        q_values = super().forward(
+            obs,
+            masks=masks,
+            hidden_state=hidden_state,
+            stochastic_output=stochastic_output,
+            actions=self.normalize_actions(obs, actions),
+        )
+        return self.select_motion_q(obs, q_values)
 
     def evaluate_all_q(
         self,
         obs: TensorDict,
         actions: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        q1, q2 = super().evaluate_all_q(obs, actions)
+        q1_all, q2_all = super().evaluate_all_q(
+            obs,
+            self.normalize_actions(obs, actions),
+        )
+        q1 = self.select_motion_q(obs, q1_all)
+        q2 = self.select_motion_q(obs, q2_all)
         if self.actor_trust_region_coef <= 0 or not actions.requires_grad:
             return q1, q2
         with torch.no_grad():
             self.actor_reference.eval()
             reference_actions = self.actor_reference(obs.detach().clone())
-        trust_penalty = (actions - reference_actions).square().mean(
-            dim=-1,
-            keepdim=True,
-        )
+        trust_penalty = (
+            self.normalize_actions(obs, actions)
+            - self.normalize_actions(obs, reference_actions)
+        ).square().mean(dim=-1, keepdim=True)
+        trust_penalty *= self.actor_reference_mask(obs)
         penalty = self.actor_trust_region_coef * trust_penalty
         return q1 - penalty, q2 - penalty
+
+    def evaluate_all_target_q(
+        self,
+        obs: TensorDict,
+        actions: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        q1_all, q2_all = super().evaluate_all_target_q(
+            obs,
+            self.normalize_actions(obs, actions),
+        )
+        return (
+            self.select_motion_q(obs, q1_all),
+            self.select_motion_q(obs, q2_all),
+        )
 
     @torch.no_grad()
     def update_actor_reference(self, actor: nn.Module, tau: float) -> None:
@@ -82,9 +222,11 @@ class TrustRegionSACCritic(SACCriticModel):
         obs: TensorDict,
     ) -> torch.Tensor:
         self.actor_reference.eval()
-        return (
+        squared_error = (
             actor(obs.detach().clone()) - self.actor_reference(obs.detach().clone())
-        ).square().mean()
+        ).square().mean(dim=-1, keepdim=True)
+        mask = self.actor_reference_mask(obs)
+        return (squared_error * mask).sum() / mask.sum().clamp(min=1)
 
 
 class FSQSACActor(nn.Module):
@@ -100,40 +242,25 @@ class FSQSACActor(nn.Module):
         super().__init__()
         learn_std = self._as_bool(config.learn_std)
         self.use_fsq = self._as_bool(config.use_fsq)
-        self.ppo_compatible_normalization = self._as_bool(
-            config.ppo_compatible_normalization
-        )
         self.freeze_normalization = self._as_bool(config.freeze_normalization)
+        self.reference_residual_actions = self._as_bool(
+            config.reference_residual_actions
+        )
+        self.reference_action_gain = config.reference_action_gain
         state_dim = obs["max_coords_obs"].shape[-1]
         target_dim = obs["mimic_target_poses"].shape[-1]
         self.output_dim = action_dim
         self.normalization_clip = config.normalization_clip
-        if self.ppo_compatible_normalization:
-            self.state_normalizer = nn.Identity()
-            self.target_normalizer = RunningMeanStd(
-                fabric=None,
-                shape=(target_dim,),
-                device="cpu",
-                clamp_value=config.normalization_clip,
-            )
-            self.decoder_normalizer = RunningMeanStd(
-                fabric=None,
-                shape=(state_dim + config.num_fsq_scalars,),
-                device="cpu",
-                clamp_value=config.normalization_clip,
-            )
-        else:
-            self.state_normalizer = (
-                EmpiricalNormalization(state_dim)
-                if config.normalize_observations
-                else nn.Identity()
-            )
-            self.target_normalizer = (
-                EmpiricalNormalization(target_dim)
-                if config.normalize_observations
-                else nn.Identity()
-            )
-            self.decoder_normalizer = nn.Identity()
+        self.state_normalizer = (
+            EmpiricalNormalization(state_dim)
+            if config.normalize_observations
+            else nn.Identity()
+        )
+        self.target_normalizer = (
+            EmpiricalNormalization(target_dim)
+            if config.normalize_observations
+            else nn.Identity()
+        )
         self.encoder = MLP(
             target_dim,
             config.num_fsq_scalars,
@@ -164,7 +291,10 @@ class FSQSACActor(nn.Module):
         last_linear = next(
             module for module in reversed(self.decoder) if isinstance(module, nn.Linear)
         )
-        nn.init.normal_(last_linear.weight, mean=0.0, std=1e-3)
+        if self.reference_residual_actions:
+            nn.init.zeros_(last_linear.weight)
+        else:
+            nn.init.normal_(last_linear.weight, mean=0.0, std=1e-3)
         nn.init.zeros_(last_linear.bias)
         Normal.set_default_validate_args(False)
 
@@ -172,10 +302,7 @@ class FSQSACActor(nn.Module):
         raw_state = obs["max_coords_obs"]
         raw_target = obs["mimic_target_poses"]
         state = self.state_normalizer(raw_state)
-        if self.ppo_compatible_normalization:
-            target = self.target_normalizer.normalize(raw_target)
-        else:
-            target = self.target_normalizer(raw_target)
+        target = self.target_normalizer(raw_target)
         state = state.clamp(-self.normalization_clip, self.normalization_clip)
         target = target.clamp(-self.normalization_clip, self.normalization_clip)
         continuous_latent = self.encoder(target)
@@ -185,8 +312,6 @@ class FSQSACActor(nn.Module):
             else continuous_latent
         )
         decoder_input = torch.cat([state, codes], dim=-1)
-        if self.ppo_compatible_normalization:
-            decoder_input = self.decoder_normalizer.normalize(decoder_input)
         mean = self.decoder(decoder_input)
         return mean, codes
 
@@ -196,8 +321,23 @@ class FSQSACActor(nn.Module):
         self.distribution = Normal(mean, std)
         return mean, codes
 
-    def _squash_and_scale(self, value: torch.Tensor) -> torch.Tensor:
-        return self.action_range * torch.tanh(value) + self.action_bias
+    def action_center(self, obs: TensorDict) -> torch.Tensor:
+        if self.reference_residual_actions:
+            if "sac_reference_action" not in obs.keys():
+                raise KeyError(
+                    "sac_reference_action is required for residual actions"
+                )
+            return self.action_bias + self.reference_action_gain * (
+                obs["sac_reference_action"] - self.action_bias
+            )
+        return self.action_bias
+
+    def _squash_and_scale(
+        self,
+        value: torch.Tensor,
+        obs: TensorDict,
+    ) -> torch.Tensor:
+        return self.action_range * torch.tanh(value) + self.action_center(obs)
 
     def forward(
         self,
@@ -210,13 +350,13 @@ class FSQSACActor(nn.Module):
         del masks, hidden_state, actions
         mean, _ = self._update_distribution(obs)
         value = self.distribution.rsample() if stochastic_output else mean
-        return self._squash_and_scale(value)
+        return self._squash_and_scale(value, obs)
 
     def sample_action_logp(self, obs: TensorDict) -> tuple[torch.Tensor, torch.Tensor]:
         self._update_distribution(obs)
         value = self.distribution.rsample()
         squashed = torch.tanh(value)
-        action = self.action_range * squashed + self.action_bias
+        action = self.action_range * squashed + self.action_center(obs)
         log_prob = self.distribution.log_prob(value).sum(dim=-1, keepdim=True)
         log_prob -= torch.log(1 - squashed.square() + 1e-6).sum(dim=-1, keepdim=True)
         log_prob -= self.log_action_range
@@ -230,27 +370,22 @@ class FSQSACActor(nn.Module):
     def effective_log_std(self) -> torch.Tensor:
         return self.log_std.clamp(self.min_log_std, self.max_log_std)
 
+    @torch.no_grad()
+    def set_physical_action_std(self, physical_action_std: float) -> None:
+        """Set vector exploration noise to a uniform physical-action scale."""
+        if physical_action_std <= 0:
+            raise ValueError("physical_action_std must be positive")
+        canonical_std = physical_action_std / self.action_range
+        canonical_std.clamp_(
+            min=math.exp(self.min_log_std),
+            max=math.exp(self.max_log_std),
+        )
+        self.log_std.copy_(canonical_std.log())
+
     def update_normalization(self, obs: TensorDict) -> None:
         if self.freeze_normalization:
             return
-        if self.ppo_compatible_normalization:
-            self.target_normalizer.record_moments(obs["mimic_target_poses"])
-            with torch.no_grad():
-                target = self.target_normalizer.normalize(
-                    obs["mimic_target_poses"]
-                )
-                continuous_latent = self.encoder(target)
-                codes = (
-                    self.quantizer.quantize(continuous_latent)
-                    if self.use_fsq
-                    else continuous_latent
-                )
-                decoder_input = torch.cat(
-                    [obs["max_coords_obs"], codes],
-                    dim=-1,
-                )
-            self.decoder_normalizer.record_moments(decoder_input)
-        elif hasattr(self.state_normalizer, "update"):
+        if hasattr(self.state_normalizer, "update"):
             self.state_normalizer.update(obs["max_coords_obs"])
             self.target_normalizer.update(obs["mimic_target_poses"])
 
@@ -284,7 +419,18 @@ class FSQSACActor(nn.Module):
         with torch.no_grad():
             mean, _ = self._features(obs)
             std = self.output_std
-            action = torch.tanh(mean)
+            action = self._squash_and_scale(mean, obs)
+            shuffled_obs = obs.detach().clone()
+            shuffled_obs["mimic_target_poses"] = torch.roll(
+                shuffled_obs["mimic_target_poses"],
+                shifts=1,
+                dims=0,
+            )
+            shuffled_mean, _ = self._features(shuffled_obs)
+            shuffled_action = self._squash_and_scale(shuffled_mean, shuffled_obs)
+            relative_action = (
+                action - self.action_center(obs)
+            ) / self.action_range
             entropy = Normal(mean, std.expand_as(mean)).entropy().sum(dim=-1)
             return {
                 "policy/std_min": std.min(),
@@ -297,41 +443,18 @@ class FSQSACActor(nn.Module):
                 "policy/action_abs_mean": action.abs().mean(),
                 "policy/action_std": action.std(),
                 "policy/action_saturation": (action.abs() > 0.95).float().mean(),
+                "policy/action_relative_saturation": (
+                    relative_action.abs() > 0.95
+                ).float().mean(),
+                "policy/action_range_min": self.action_range.min(),
+                "policy/action_range_mean": self.action_range.mean(),
+                "policy/action_range_max": self.action_range.max(),
+                "policy/action_bias_abs_mean": self.action_bias.abs().mean(),
                 "policy/pre_tanh_entropy": entropy.mean(),
+                "policy/target_action_sensitivity": (
+                    action - shuffled_action
+                ).abs().mean(),
             }
-
-    def load_ppo_actor_checkpoint(self, checkpoint_path: str) -> None:
-        if not self.ppo_compatible_normalization or not self.use_fsq:
-            raise ValueError(
-                "PPO actor warm-start requires FSQ and PPO-compatible normalization"
-            )
-        checkpoint = torch.load(
-            checkpoint_path,
-            map_location="cpu",
-            weights_only=False,
-        )
-        state = checkpoint["model"]
-        with torch.no_grad():
-            for module_name, module in (
-                ("encoder", self.encoder),
-                ("decoder", self.decoder),
-            ):
-                source_prefix = f"_actor.mu.{module_name}.mlp."
-                for key, value in state.items():
-                    if key.startswith(source_prefix):
-                        destination = key.removeprefix(source_prefix)
-                        module.state_dict()[destination].copy_(value)
-
-            self.log_std.copy_(state["_actor.logstd"])
-            for module_name, source_name in (
-                ("target_normalizer", "_actor.mu.encoder.norm.running_obs_norm"),
-                ("decoder_normalizer", "_actor.mu.decoder.norm.running_obs_norm"),
-            ):
-                normalizer = getattr(self, module_name)
-                normalizer.mean.copy_(state[f"{source_name}.mean"])
-                normalizer.var.copy_(state[f"{source_name}.var"])
-                normalizer.count.copy_(state[f"{source_name}.count"])
-
 
 class FSQSACModel(BaseModel):
     """ProtoMotions evaluator/checkpoint wrapper around SAC actor and twin critic."""
@@ -341,29 +464,41 @@ class FSQSACModel(BaseModel):
     def __init__(self, config: FSQSACModelConfig, obs: TensorDict, action_dim: int):
         super().__init__(config)
         self.actor = FSQSACActor(obs, action_dim, config)
-        if config.ppo_actor_checkpoint is not None:
-            checkpoint_path = Path(config.ppo_actor_checkpoint)
-            if checkpoint_path.is_file():
-                self.actor.load_ppo_actor_checkpoint(str(checkpoint_path))
-            else:
-                log.warning(
-                    "PPO warm-start source %s is unavailable; constructing the "
-                    "actor for self-contained checkpoint loading.",
-                    checkpoint_path,
-                )
         self.critic = TrustRegionSACCritic(
             obs=obs,
             obs_groups={
                 "critic": ["max_coords_obs", "mimic_target_poses"],
             },
             obs_set="critic",
-            output_dim=1,
+            output_dim=config.critic_num_motion_heads,
             hidden_dims=list(config.critic_hidden_dims),
             activation="relu",
             obs_normalization=config.normalize_observations,
             num_actions=action_dim,
             actor_reference=self.actor,
             actor_trust_region_coef=config.actor_trust_region_coef,
+            actor_reference_motion_ids=config.actor_reference_motion_ids,
+            reference_residual_actions=config.reference_residual_actions,
+            reference_action_gain=config.reference_action_gain,
+        )
+        if config.reference_residual_actions:
+            if config.reference_residual_action_scale <= 0:
+                raise ValueError(
+                    "reference_residual_action_scale must be positive"
+                )
+            if not 0.0 <= config.reference_action_gain <= 1.0:
+                raise ValueError("reference_action_gain must be in [0, 1]")
+            with torch.no_grad():
+                self.actor.action_bias.zero_()
+                self.actor.action_range.fill_(
+                    config.reference_residual_action_scale
+                )
+                self.actor.log_action_range.copy_(
+                    torch.log(self.actor.action_range).sum()
+                )
+        self.critic.set_action_scaling(
+            self.actor.action_bias,
+            self.actor.action_range,
         )
         self.in_keys = list(config.in_keys)
         self.out_keys = list(config.out_keys)
